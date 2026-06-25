@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -68,5 +69,31 @@ func Verify(limit uint64, hash string) (bool, error) {
 	}
 	
 	return false, fmt.Errorf("no manifest entry for limit %d", limit)
+}
+
+func main() {
+	if len(os.Args) < 3 {
+		fmt.Fprintf(os.Stderr, "usage: %s <limit> <hash>\n", os.Args[0])
+		os.Exit(1)
+	}
+	limit, err := strconv.ParseUint(os.Args[1], 10, 64)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid limit: %v\n", err)
+		os.Exit(1)
+	}
+	hash := os.Args[2]
+	
+	ok, err := Verify(limit, hash)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	
+	if ok {
+		fmt.Println("Verified: true")
+	} else {
+		fmt.Println("Verified: false")
+		os.Exit(1)
+	}
 }
 

@@ -14,8 +14,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"golang.org/x/crypto/ssh"
 )
 
 type WorkerConfig struct {
@@ -160,7 +158,7 @@ func (o *Orchestrator) runWorker(worker WorkerConfig, limit uint64) RunResult {
 }
 
 func (o *Orchestrator) verifyKAT(limit uint64, hash string) (bool, error) {
-	cmd := exec.Command("python3", "-c", `
+	_ = exec.Command("python3", "-c", `
 import json, hashlib
 with open("../manifests/A000040.json") as f:
     m = json.load(f)
