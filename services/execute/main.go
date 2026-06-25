@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 )
 
@@ -109,4 +110,30 @@ func runWithCapture(cmd *exec.Cmd) (string, string, error) {
 	return string(stdoutBytes), string(stderrBytes), err
 }
 
-func main() {}
+func main() {
+	if len(os.Args) < 3 {
+		fmt.Println("usage: execute <binary_path> <limit> [worker_name] [host]")
+		os.Exit(1)
+	}
+	binaryPath := os.Args[1]
+	limit, err := strconv.ParseUint(os.Args[2], 10, 64)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid limit: %v\n", err)
+		os.Exit(1)
+	}
+	result, err := Execute(binaryPath, limit)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "execute error: %v\n", err)
+		os.Exit(1)
+	}
+	if len(os.Args) > 3 {
+		result.Worker = os.Args[3]
+	}
+	if len(os.Args) > 4 {
+		result.Host = os.Args[4]
+	}
+	json.NewEncoder(os.Stdout).Encode(result)
+	if !result.Success {
+		os.Exit(1)
+	}
+}

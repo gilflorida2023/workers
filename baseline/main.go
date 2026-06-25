@@ -5,27 +5,18 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"runtime"
+	"strconv"
 	"time"
 
 	"github.com/primeforge/shared/sieve"
 )
 
-type Result struct {
-	DurationMs int64   `json:"duration_ms"`
-	Primes     uint64  `json:"primes"`
-	PeakMemMB  uint64  `json:"peak_mem_mb"`
-	Config     string  `json:"config"`
-	Worker     string  `json:"worker"`
-	Host       string  `json:"host"`
-	Limit      uint64  `json:"limit"`
-	Timestamp  int64   `json:"timestamp"`
-	CodeHash   string  `json:"code_hash"`
-}
-
 func main() {
 	limit := flag.Uint64("limit", 100_000_000, "Sieve limit")
 	wantHash := flag.Bool("hash", false, "Output KAT hash to stdout")
+	verifyKAT := flag.Bool("verify", false, "Self-verify KAT hash via kat_verify tool")
 	flag.Parse()
 
 	hostname, _ := os.Hostname()
@@ -47,22 +38,31 @@ func main() {
 	runtime.ReadMemStats(&mem)
 	peakMemMB := mem.Sys / 1024 / 1024
 
-	result := Result{
-		DurationMs: duration.Milliseconds(),
-		Primes:     count,
-		PeakMemMB:  peakMemMB,
-		Config:     `{"wheel":210,"parallel":true,"segment_kb":256}`,
-		Worker:     "baseline",
-		Host:       hostname,
-		Limit:      *limit,
-		Timestamp:  time.Now().UnixMilli(),
-		CodeHash:   "baseline-wheel210-parallel",
+	result := map[string]any{
+		"worker":       "w1_baseline",
+		"host":         hostname,
+		"limit":        *limit,
+		"duration_ms":  duration.Milliseconds(),
+		"primes":       count,
+		"peak_mem_mb":  peakMemMB,
+		"kat_hash":     hasher.HexSum(),
+		"config":       map[string]string{"wheel": "210", "parallel": "true", "segment_kb": "256"},
+		"success":      true,
 	}
 
 	if *wantHash {
-		fmt.Println(hasher.HexSum())
+		hash := hasher.HexSum()
+		fmt.Println(hash)
+
+		if *verifyKAT {
+			cmd := exec.Command("kat_verify", strconv.FormatUint(*limit, 10), hash)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			if err := cmd.Run(); err != nil {
+				os.Exit(1)
+			}
+		}
 	}
 
-	jsonResult, _ := json.Marshal(result)
-	fmt.Fprintln(os.Stderr, string(jsonResult))
+	json.NewEncoder(os.Stderr).Encode(result)
 }

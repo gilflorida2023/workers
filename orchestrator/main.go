@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -15,6 +16,26 @@ import (
 	"sync"
 	"time"
 )
+
+type TraceEntry struct {
+	Timestamp   int64  `json:"timestamp"`
+	Event       string `json:"event"`
+	Worker      string `json:"worker,omitempty"`
+	Host        string `json:"host,omitempty"`
+	Limit       uint64 `json:"limit,omitempty"`
+	Command     string `json:"command,omitempty"`
+	Args        []string `json:"args,omitempty"`
+	StartTime   int64  `json:"start_time,omitempty"`
+	EndTime     int64  `json:"end_time,omitempty"`
+	DurationMs  int64  `json:"duration_ms,omitempty"`
+	ExitCode    int    `json:"exit_code,omitempty"`
+	Stdout      string `json:"stdout,omitempty"`
+	Stderr      string `json:"stderr,omitempty"`
+	KATHash     string `json:"kat_hash,omitempty"`
+	RequestBody string `json:"request_body,omitempty"`
+	Response    string `json:"response,omitempty"`
+	Error       string `json:"error,omitempty"`
+}
 
 type WorkerConfig struct {
 	Name        string            `json:"name"`
@@ -55,6 +76,7 @@ type Orchestrator struct {
 	workers    []WorkerConfig
 	judgeURL   string
 	logFile    *os.File
+	traceFile  *os.File
 	mu         sync.Mutex
 	resultsDir string
 }
@@ -68,10 +90,16 @@ func NewOrchestrator(workers []WorkerConfig, judgeURL, resultsDir string) (*Orch
 	if err != nil {
 		return nil, err
 	}
+	tracePath := filepath.Join(resultsDir, fmt.Sprintf("trace_%d.jsonl", time.Now().UnixMilli()))
+	tf, err := os.OpenFile(tracePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, err
+	}
 	return &Orchestrator{
 		workers:    workers,
 		judgeURL:   judgeURL,
 		logFile:    f,
+		traceFile:  tf,
 		resultsDir: resultsDir,
 	}, nil
 }
@@ -84,13 +112,22 @@ func (o *Orchestrator) log(entry any) {
 	o.logFile.WriteString("\n")
 }
 
+func (o *Orchestrator) trace(entry TraceEntry) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	entry.Timestamp = time.Now().UnixMilli()
+	data, _ := json.Marshal(entry)
+	o.traceFile.Write(append(data, '\n'))
+}
+
 func (o *Orchestrator) Close() {
 	o.logFile.Close()
+	o.traceFile.Close()
 }
 
 func (o *Orchestrator) buildWorker(worker WorkerConfig) error {
-	cmd := exec.Command("go", "build", "-o", filepath.Join("../bin", worker.Name), ".")
-	cmd.Dir = filepath.Join("../", worker.Name)
+	cmd := exec.Command("go", "build", "-o", filepath.Join("bin", worker.Name), ".")
+	cmd.Dir = worker.Name
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("build failed: %v\n%s", err, output)
@@ -102,7 +139,7 @@ func (o *Orchestrator) deployWorker(worker WorkerConfig) error {
 	if worker.Host == "localhost" || worker.Host == "127.0.0.1" {
 		return nil
 	}
-	binaryPath := filepath.Join("../bin", worker.Name)
+	binaryPath := filepath.Join("bin", worker.Name)
 	cmd := exec.Command("scp", binaryPath, fmt.Sprintf("%s@%s:%s", worker.User, worker.Host, worker.BinaryPath))
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -113,22 +150,38 @@ func (o *Orchestrator) deployWorker(worker WorkerConfig) error {
 
 func (o *Orchestrator) runWorker(worker WorkerConfig, limit uint64) RunResult {
 	var cmd *exec.Cmd
+	binaryPath := filepath.Join("bin", worker.Name)
+	args := []string{"--limit", strconv.FormatUint(limit, 10), "--hash"}
 	if worker.Host == "localhost" || worker.Host == "127.0.0.1" {
-		cmd = exec.Command(filepath.Join("../bin", worker.Name), "--limit", strconv.FormatUint(limit, 10), "--hash")
+		cmd = exec.Command(binaryPath, args...)
 	} else {
 		cmd = exec.Command("ssh", fmt.Sprintf("%s@%s", worker.User, worker.Host), fmt.Sprintf("%s --limit %d --hash", worker.BinaryPath, limit))
 	}
 
+	startTime := time.Now()
+	o.trace(TraceEntry{
+		Event:     "worker_start",
+		Worker:    worker.Name,
+		Host:      worker.Host,
+		Limit:     limit,
+		Command:   binaryPath,
+		Args:      args,
+		StartTime: startTime.UnixMilli(),
+	})
+
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		o.trace(TraceEntry{Event: "worker_error", Worker: worker.Name, Host: worker.Host, Limit: limit, Error: err.Error()})
 		return RunResult{Worker: worker.Name, Host: worker.Host, Limit: limit, Success: false, Error: err.Error()}
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
+		o.trace(TraceEntry{Event: "worker_error", Worker: worker.Name, Host: worker.Host, Limit: limit, Error: err.Error()})
 		return RunResult{Worker: worker.Name, Host: worker.Host, Limit: limit, Success: false, Error: err.Error()}
 	}
 
 	if err := cmd.Start(); err != nil {
+		o.trace(TraceEntry{Event: "worker_error", Worker: worker.Name, Host: worker.Host, Limit: limit, Error: err.Error()})
 		return RunResult{Worker: worker.Name, Host: worker.Host, Limit: limit, Success: false, Error: err.Error()}
 	}
 
@@ -140,13 +193,28 @@ func (o *Orchestrator) runWorker(worker WorkerConfig, limit uint64) RunResult {
 
 	var result RunResult
 	stderrScanner := bufio.NewScanner(stderr)
+	var stderrText string
 	if stderrScanner.Scan() {
+		stderrText = stderrScanner.Text()
 		if err := json.Unmarshal(stderrScanner.Bytes(), &result); err != nil {
 			log.Printf("Failed to parse stderr JSON: %v", err)
 		}
 	}
 
 	cmd.Wait()
+	endTime := time.Now()
+
+	o.trace(TraceEntry{
+		Event:      "worker_end",
+		Worker:     worker.Name,
+		Host:       worker.Host,
+		Limit:      limit,
+		EndTime:    endTime.UnixMilli(),
+		DurationMs: endTime.Sub(startTime).Milliseconds(),
+		Stdout:     katHash,
+		Stderr:     stderrText,
+		KATHash:    katHash,
+	})
 
 	result.Worker = worker.Name
 	result.Host = worker.Host
@@ -160,7 +228,7 @@ func (o *Orchestrator) runWorker(worker WorkerConfig, limit uint64) RunResult {
 func (o *Orchestrator) verifyKAT(limit uint64, hash string) (bool, error) {
 	_ = exec.Command("python3", "-c", `
 import json, hashlib
-with open("../manifests/A000040.json") as f:
+with open("manifests/A000040.json") as f:
     m = json.load(f)
 for ckpt in m.get("checkpoint_hashes", {}):
     pass
@@ -172,8 +240,17 @@ func (o *Orchestrator) queryJudge(ctx context.Context, results []RunResult, limi
 	req := JudgeRequest{Results: results, Limit: limit}
 	body, _ := json.Marshal(req)
 
+	startTime := time.Now()
+	o.trace(TraceEntry{
+		Event:       "judge_request",
+		Limit:       limit,
+		RequestBody: string(body),
+		StartTime:   startTime.UnixMilli(),
+	})
+
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", o.judgeURL+"/judge", strings.NewReader(string(body)))
 	if err != nil {
+		o.trace(TraceEntry{Event: "judge_error", Limit: limit, Error: err.Error()})
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
@@ -181,14 +258,33 @@ func (o *Orchestrator) queryJudge(ctx context.Context, results []RunResult, limi
 	client := &http.Client{Timeout: 120 * time.Second}
 	resp, err := client.Do(httpReq)
 	if err != nil {
+		o.trace(TraceEntry{Event: "judge_error", Limit: limit, Error: err.Error()})
 		return nil, err
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		errMsg := fmt.Sprintf("judge returned status %d: %s", resp.StatusCode, string(bodyBytes))
+		o.trace(TraceEntry{Event: "judge_error", Limit: limit, Error: errMsg})
+		return nil, fmt.Errorf(errMsg)
+	}
+
 	var judgeResp JudgeResponse
 	if err := json.NewDecoder(resp.Body).Decode(&judgeResp); err != nil {
+		o.trace(TraceEntry{Event: "judge_error", Limit: limit, Error: err.Error()})
 		return nil, err
 	}
+
+	endTime := time.Now()
+	respBody, _ := json.Marshal(judgeResp)
+	o.trace(TraceEntry{
+		Event:      "judge_response",
+		Limit:      limit,
+		Response:   string(respBody),
+		EndTime:    endTime.UnixMilli(),
+		DurationMs: endTime.Sub(startTime).Milliseconds(),
+	})
 	return &judgeResp, nil
 }
 
@@ -261,12 +357,12 @@ func (o *Orchestrator) RunRound(limit uint64) error {
 
 func main() {
 	workers := []WorkerConfig{
-		{Name: "w1_baseline", Host: "localhost", User: "scout", BinaryPath: "~/bin/w1_baseline"},
-		{Name: "w2_wheel2310", Host: "second", User: "second", BinaryPath: "~/bin/w2_wheel2310"},
-		{Name: "w3_seq_cacheopt", Host: "third", User: "third", BinaryPath: "~/bin/w3_seq_cacheopt"},
+		{Name: "w1_baseline", Host: "localhost", User: "", BinaryPath: "./bin/w1_baseline"},
+		{Name: "w2_wheel2310", Host: "localhost", User: "", BinaryPath: "./bin/w2_wheel2310"},
+		{Name: "w3_seq_cacheopt", Host: "localhost", User: "", BinaryPath: "./bin/w3_seq_cacheopt"},
 	}
 
-	judgeURL := "http://192.168.0.8:11435"
+	judgeURL := "http://127.0.0.1:11435"
 	resultsDir := "../results"
 
 	orch, err := NewOrchestrator(workers, judgeURL, resultsDir)
@@ -275,7 +371,7 @@ func main() {
 	}
 	defer orch.Close()
 
-	stages := []uint64{1_000_000, 10_000_000, 100_000_000}
+	stages := []uint64{541, 7919, 1299709}
 	for _, limit := range stages {
 		if err := orch.RunRound(limit); err != nil {
 			log.Fatalf("Round failed: %v", err)

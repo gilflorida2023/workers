@@ -1,72 +1,32 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"net/http"
+	"os"
 	"time"
+
+	ollama "github.com/primeforge/services/ollama_client/ollama"
 )
 
-type OllamaClient struct {
-	httpClient *http.Client
-}
-
-type GenerateRequest struct {
-	Model   string `json:"model"`
-	Prompt  string `json:"prompt"`
-	Format  string `json:"format,omitempty"`
-	Stream  bool   `json:"stream"`
-	Options map[string]interface{} `json:"options,omitempty"`
-}
-
-type GenerateResponse struct {
-	Response string `json:"response"`
-	Done     bool   `json:"done"`
-}
-
-func NewOllamaClient(timeout time.Duration) *OllamaClient {
-	return &OllamaClient{
-		httpClient: &http.Client{Timeout: timeout},
+func main() {
+	if len(os.Args) < 4 {
+		fmt.Println("usage: ollama_client <host> <model> <prompt> [--json]")
+		os.Exit(1)
 	}
-}
-
-func (c *OllamaClient) Call(ctx context.Context, host, model, prompt string, formatJSON bool) (string, error) {
-	url := fmt.Sprintf("http://%s:11434/api/generate", host)
-	
-	reqBody := GenerateRequest{
-		Model:  model,
-		Prompt: prompt,
-		Stream: false,
+	host := os.Args[1]
+	model := os.Args[2]
+	prompt := os.Args[3]
+	formatJSON := false
+	if len(os.Args) > 4 && os.Args[4] == "--json" {
+		formatJSON = true
 	}
-	if formatJSON {
-		reqBody.Format = "json"
-	}
-	
-	jsonBody, err := json.Marshal(reqBody)
+	client := ollama.NewOllamaClient(30 * time.Second)
+	ctx := context.Background()
+	resp, err := client.Call(ctx, host, model, prompt, formatJSON)
 	if err != nil {
-		return "", err
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
 	}
-	
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonBody))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	
-	var genResp GenerateResponse
-	if err := json.NewDecoder(resp.Body).Decode(&genResp); err != nil {
-		return "", err
-	}
-	
-	return genResp.Response, nil
+	fmt.Println(resp)
 }
-
-func main() {}

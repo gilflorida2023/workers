@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"time"
@@ -66,4 +68,22 @@ func CompileBaseline(baselineDir string) CompileResult {
 	}
 }
 
-func main() {}
+func main() {
+	if len(os.Args) < 3 {
+		fmt.Println("usage: compile <worker|baseline> <directory>")
+		os.Exit(1)
+	}
+	var result CompileResult
+	if os.Args[1] == "worker" {
+		result = CompileWorker(os.Args[2])
+	} else if os.Args[1] == "baseline" {
+		result = CompileBaseline(os.Args[2])
+	} else {
+		fmt.Fprintf(os.Stderr, "unknown type: %s\n", os.Args[1])
+		os.Exit(1)
+	}
+	json.NewEncoder(os.Stdout).Encode(result)
+	if !result.Success {
+		os.Exit(1)
+	}
+}
