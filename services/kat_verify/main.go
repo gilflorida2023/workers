@@ -40,9 +40,9 @@ func LoadManifest(manifestPath string) error {
 	return nil
 }
 
-func Verify(limit uint64, hash string) (bool, error) {
+func Verify(limit uint64, hash string, manifestPath string) (bool, error) {
 	if manifest == nil {
-		if err := LoadManifest(filepath.Join("..", "..", "manifests", "A000040.json")); err != nil {
+		if err := LoadManifest(manifestPath); err != nil {
 			return false, err
 		}
 	}
@@ -72,8 +72,8 @@ func Verify(limit uint64, hash string) (bool, error) {
 }
 
 func main() {
-	if len(os.Args) < 3 {
-		fmt.Fprintf(os.Stderr, "usage: %s <limit> <hash>\n", os.Args[0])
+	if len(os.Args) < 3 || len(os.Args) > 4 {
+		fmt.Fprintf(os.Stderr, "usage: %s <limit> <hash> [manifest_path]\n", os.Args[0])
 		os.Exit(1)
 	}
 	limit, err := strconv.ParseUint(os.Args[1], 10, 64)
@@ -83,7 +83,12 @@ func main() {
 	}
 	hash := os.Args[2]
 	
-	ok, err := Verify(limit, hash)
+	manifestPath := filepath.Join("..", "..", "manifests", "A000040.json")
+	if len(os.Args) == 4 {
+		manifestPath = os.Args[3]
+	}
+	
+	ok, err := Verify(limit, hash, manifestPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
