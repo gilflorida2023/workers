@@ -3,3 +3,8 @@ bin/
 logs/
 results/
 .DS_Store
+
+# Runtime artifacts
+scout/sessions/
+scout/locks/
+scout/contexts/
