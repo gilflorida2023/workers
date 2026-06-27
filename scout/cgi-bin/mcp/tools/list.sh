@@ -20,7 +20,15 @@ cat << 'TOOLS'
     {"name": "baseline.config", "description": "Get baseline config", "input_schema": {"type": "object", "properties": {}}},
     {"name": "kat_verify.verify", "description": "Verify KAT hash against manifest", "input_schema": {"type": "object", "properties": {"prime_count": {"type": "integer"}, "kat_hash": {"type": "string"}}}},
     {"name": "manifest.get", "description": "Get manifest A000040.json", "input_schema": {"type": "object", "properties": {}}},
-    {"name": "judge.heuristic", "description": "Judge worker results via heuristic", "input_schema": {"type": "object", "properties": {"entity": {"type": "string"}, "worker_results": {"type": "array", "items": {"type": "object"}}}}}
+    {"name": "judge.heuristic", "description": "Judge worker results via heuristic", "input_schema": {"type": "object", "properties": {"entity": {"type": "string"}, "worker_results": {"type": "array", "items": {"type": "object"}}}}},
+    {"name": "arena.get_context", "description": "Get current match context: baseline code, problem tier, limit", "input_schema": {"type": "object", "properties": {"worker_id": {"type": "string"}}}},
+    {"name": "arena.read_file", "description": "Read a file from worker sandbox", "input_schema": {"type": "object", "properties": {"worker_id": {"type": "string"}, "path": {"type": "string"}}}},
+    {"name": "arena.write_file", "description": "Write a file to worker sandbox", "input_schema": {"type": "object", "properties": {"worker_id": {"type": "string"}, "path": {"type": "string"}, "content": {"type": "string"}}}},
+    {"name": "arena.submit", "description": "Submit worker code for judging", "input_schema": {"type": "object", "properties": {"worker_id": {"type": "string"}}}},
+    {"name": "arena.leaderboard", "description": "Get current leaderboard", "input_schema": {"type": "object", "properties": {}}},
+    {"name": "arena.status", "description": "Get worker status and history", "input_schema": {"type": "object", "properties": {"worker_id": {"type": "string"}}}},
+    {"name": "arena.match_result", "description": "Get last match result for a worker", "input_schema": {"type": "object", "properties": {"worker_id": {"type": "string"}}}},
+    {"name": "arena.run_match", "description": "Run a full match between two workers", "input_schema": {"type": "object", "properties": {"worker1_host": {"type": "string"}, "worker2_host": {"type": "string"}, "model": {"type": "string"}}}}
   ]
 }
 TOOLS

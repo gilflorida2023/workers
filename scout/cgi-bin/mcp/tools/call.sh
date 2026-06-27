@@ -52,6 +52,30 @@ case "$TOOL_NAME" in
     judge.heuristic)
         /home/scout/projects/workers/scout/cgi-bin/judge/heuristic.sh <<< "$ARGS"
         ;;
+    arena.get_context)
+        /home/scout/projects/workers/scout/cgi-bin/arena/get_context.sh <<< "$ARGS"
+        ;;
+    arena.read_file)
+        /home/scout/projects/workers/scout/cgi-bin/arena/read_file.sh <<< "$ARGS"
+        ;;
+    arena.write_file)
+        /home/scout/projects/workers/scout/cgi-bin/arena/write_file.sh <<< "$ARGS"
+        ;;
+    arena.submit)
+        /home/scout/projects/workers/scout/cgi-bin/arena/submit.sh <<< "$ARGS"
+        ;;
+    arena.leaderboard)
+        /home/scout/projects/workers/scout/cgi-bin/arena/leaderboard.sh <<< "$ARGS"
+        ;;
+    arena.status)
+        /home/scout/projects/workers/scout/cgi-bin/arena/status.sh <<< "$ARGS"
+        ;;
+    arena.match_result)
+        /home/scout/projects/workers/scout/cgi-bin/arena/match_result.sh <<< "$ARGS"
+        ;;
+    arena.run_match)
+        /home/scout/projects/workers/scout/cgi-bin/arena/run_match.sh <<< "$ARGS"
+        ;;
     *)
         echo '{"success":false,"error":"Unknown tool: '"$TOOL_NAME"'","retryable":false}'
         exit 1
