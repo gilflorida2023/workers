@@ -28,7 +28,8 @@ cat << 'TOOLS'
     {"name": "arena.leaderboard", "description": "Get current leaderboard", "input_schema": {"type": "object", "properties": {}}},
     {"name": "arena.status", "description": "Get worker status and history", "input_schema": {"type": "object", "properties": {"worker_id": {"type": "string"}}}},
     {"name": "arena.match_result", "description": "Get last match result for a worker", "input_schema": {"type": "object", "properties": {"worker_id": {"type": "string"}}}},
-    {"name": "arena.run_match", "description": "Run a full match between two workers", "input_schema": {"type": "object", "properties": {"worker1_host": {"type": "string"}, "worker2_host": {"type": "string"}, "model": {"type": "string"}}}}
+    {"name": "arena.run_match", "description": "Run a full match between two workers", "input_schema": {"type": "object", "properties": {"worker1_host": {"type": "string"}, "worker2_host": {"type": "string"}, "model": {"type": "string"}}}},
+    {"name": "arena.tool_prove", "description": "Proving ground: test worker agents' ability to compile and run code to answer a question", "input_schema": {"type": "object", "properties": {"worker1_host": {"type": "string"}, "worker2_host": {"type": "string"}, "model": {"type": "string"}}}}
   ]
 }
 TOOLS

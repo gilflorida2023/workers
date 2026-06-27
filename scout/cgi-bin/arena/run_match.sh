@@ -52,7 +52,7 @@ TOOLS_JSON=$(cat <<'TOOLS'
   {"type":"function","function":{"name":"read_file","description":"Read a file from your workspace. Files: sieve.go (sieve implementation), main.go (entry point), go.mod.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"filename"}},"required":["path"]}}},
   {"type":"function","function":{"name":"write_file","description":"Write code to a file in your workspace. Use this to modify the sieve algorithm.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"filename"}, "content":{"type":"string","description":"file content"}},"required":["path","content"]}}},
   {"type":"function","function":{"name":"compile","description":"Compile your Go code in the workspace. Returns success or compilation errors.","parameters":{"type":"object","properties":{}}}},
-  {"type":"function","function":{"name":"run","description":"Run your compiled sieve program with a given limit. Returns KAT hash, prime count, duration, memory.","parameters":{"type":"object","properties":{"limit":{"type":"integer","description":"sieve upper bound","default":541}},"required":[]}}},
+  {"type":"function","function":{"name":"run","description":"Run your compiled sieve program. Returns KAT hash, prime count, duration, memory.","parameters":{"type":"object","properties":{"limit":{"type":"integer","description":"sieve upper bound","default":100},"wheel":{"type":"integer","description":"wheel modulus: 30, 210 (default), 2310, or 30030","default":210}},"required":[]}}},
   {"type":"function","function":{"name":"submit_for_match","description":"Submit your current code as your entry for the match. Call this when you are satisfied with your improvement.","parameters":{"type":"object","properties":{}}}},
   {"type":"function","function":{"name":"get_leaderboard","description":"View the current leaderboard.","parameters":{"type":"object","properties":{}}}}
 ]
@@ -68,19 +68,25 @@ The current problem: Sieve of Eratosthenes up to limit=$LIMIT
 The project has two files: main.go (CLI entry point) and internal/sieve/sieve.go (sieve algorithm).
 The baseline uses bit-packed segmented sieve with wheel-210 factorization in internal/sieve/sieve.go.
 
-You have these tools:
-1. read_file(path) — read source files (e.g. "internal/sieve/sieve.go", "main.go", "go.mod")
-2. write_file(path, content) — write modified source files
-3. compile() — compile your Go code
-4. run(limit) — test your compiled program
-5. submit_for_match() — submit your best version for judging
-6. get_leaderboard() — see standings
+─── Tool Quick Reference ─────────────────────────────────────────
+read_file(path)       "internal/sieve/sieve.go", "main.go", "go.mod"
+write_file(path,content)  write code, then compile to test it
+compile()             go build in sandbox; returns success or errors
+run(limit, [wheel])   executes with -limit N [-wheel W]; returns:
+                      → kat_hash (SHA-256 hex of prime list)
+                      → result.duration_ms, result.primes, result.peak_mem_mb
+                      Use limit=100 for quick test, wheel=30/210/2310/30030
+submit_for_match()    git-commit your entry (call when ready)
+get_leaderboard()     see standings
+────────────────────────────────────────────────────────────────
+Workflow: read → edit → compile → run → repeat
 
 Strategy tips:
 - Start by reading internal/sieve/sieve.go to understand the algorithm
 - Edit internal/sieve/sieve.go to improve the sieve; edit main.go only if needed
 - Try optimizations: larger wheels (2310, 30030), concurrent goroutines, better memory layout
 - Compile and test after each change
+- Always compile before run
 - Submit when you have a genuine improvement
 - Higher sieve limits reward better algorithms
 PROMPT
@@ -142,16 +148,17 @@ execute_tool() {
             echo '{"success":true}'
             ;;
         run)
-            local run_limit
-            run_limit=$(echo "$tool_args" | jq -r '.limit // 541')
+            local run_limit run_wheel
+            run_limit=$(echo "$tool_args" | jq -r '.limit // 100')
+            run_wheel=$(echo "$tool_args" | jq -r '.wheel // 210')
             local dir="$ARENA_DIR/$worker_id"
             if [[ ! -x "$dir/worker" ]]; then
                 echo '{"success":false,"error":"binary not found; compile first"}'
                 return
             fi
             local stdout stderr exit_code
-            stdout=$("$dir/worker" -limit "$run_limit" -hash 2>/dev/null) || exit_code=$?
-            stderr=$("$dir/worker" -limit "$run_limit" 2>&1 >/dev/null) || true
+            stdout=$("$dir/worker" -limit "$run_limit" -wheel "$run_wheel" -hash 2>/dev/null) || exit_code=$?
+            stderr=$("$dir/worker" -limit "$run_limit" -wheel "$run_wheel" 2>&1 >/dev/null) || true
             if [[ -n "$exit_code" && "$exit_code" -ne 0 ]]; then
                 echo "{\"success\":false,\"error\":\"run failed with exit code $exit_code\",\"stderr\":$(echo "$stderr" | jq -Rs .)}"
                 return

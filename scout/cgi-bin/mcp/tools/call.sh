@@ -76,6 +76,9 @@ case "$TOOL_NAME" in
     arena.run_match)
         /home/scout/projects/workers/scout/cgi-bin/arena/run_match.sh <<< "$ARGS"
         ;;
+    arena.tool_prove)
+        /home/scout/projects/workers/scout/cgi-bin/arena/tool_prove.sh <<< "$ARGS"
+        ;;
     *)
         echo '{"success":false,"error":"Unknown tool: '"$TOOL_NAME"'","retryable":false}'
         exit 1
