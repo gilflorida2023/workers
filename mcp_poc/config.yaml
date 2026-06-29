@@ -7,7 +7,7 @@ ollama:
   host: "localhost"
   port: 11434
   model: "huihui_ai/qwen3.5-abliterated:9b"
-  timeout: 300
+  timeout: 600
 
 workspace:
   path: "/home/scout/projects/sandbox/workspace"

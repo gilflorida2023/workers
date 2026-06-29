@@ -125,7 +125,6 @@ class Pipeline:
         if user:
             final_user = user
             if output_schema:
-                # Build example from schema to show the model what we want
                 example = self._schema_to_example(output_schema)
                 schema_hint = (
                     "\n\nRespond ONLY with valid JSON. "
@@ -137,7 +136,14 @@ class Pipeline:
             messages.append({"role": "user", "content": final_user})
 
         fmt = "json" if output_schema else None
-        response = await self.ollama.chat(messages, format=fmt)
+        try:
+            response = await self.ollama.chat(messages, format=fmt)
+        except Exception as e:
+            logger.warning("Phase '%s' LLM call failed: %s", name, e)
+            result = {"raw": "", "_error": str(e)}
+            self._persist_phase(name, result, "", messages)
+            return result
+
         content = response.get("message", {}).get("content", "")
 
         result = self._parse_output(content, output_schema)
@@ -169,12 +175,26 @@ class Pipeline:
                 continue
 
             prompts = prepare_fn(item)
-            result = await self._phase(
-                phase_name,
-                system=prompts.get("system"),
-                user=prompts.get("user"),
-                output_schema=output_schema,
-            )
+            if prompts.get("_skip"):
+                logger.info("Skipping batch item '%s': %s", phase_name, prompts.get("_reason", "no reason"))
+                result = {"_key": str(item), "_skipped": True, "_reason": prompts.get("_reason", "")}
+                self._persist_phase(phase_name, result, "(skipped)", [])
+                results.append(result)
+                continue
+
+            try:
+                result = await self._phase(
+                    phase_name,
+                    system=prompts.get("system"),
+                    user=prompts.get("user"),
+                    output_schema=output_schema,
+                )
+            except Exception as e:
+                logger.warning("Batch item '%s' failed: %s", phase_name, e)
+                result = {"_key": str(item), "_error": str(e)}
+                results.append(result)
+                continue
+
             result["_key"] = str(item)
             results.append(result)
 
@@ -202,6 +222,24 @@ class Pipeline:
     def _read_file(self, rel_path: str) -> str:
         full = _safe_path(rel_path)
         return full.read_text()
+
+    def _is_text_file(self, rel_path: str, sample_size: int = 1024) -> bool:
+        """Quick check if a file is text (valid UTF-8) and not a binary."""
+        try:
+            full = _safe_path(rel_path)
+            data = full.read_bytes()[:sample_size]
+            data.decode("utf-8")
+            return True
+        except (ValueError, UnicodeDecodeError, OSError):
+            return False
+
+    def _file_size_kb(self, rel_path: str) -> int:
+        """Return file size in KB for threshold checks."""
+        try:
+            full = _safe_path(rel_path)
+            return full.stat().st_size // 1024
+        except OSError:
+            return 0
 
     def _detect_language(self, path: str) -> str:
         ext = Path(path).suffix.lower()
@@ -304,6 +342,182 @@ class Pipeline:
         with open(conv_path, "a") as f:
             f.write(json.dumps(entry) + "\n")
 
+    # ── YAML-driven phase runner ───────────────────────────────────────────
+
+    def _load_yaml_defs(self, path: Path) -> dict:
+        """Load phase definitions from a YAML file."""
+        import yaml as _yaml
+        with open(path) as f:
+            return _yaml.safe_load(f)
+
+    async def _run_yaml(self, task: str, yaml_path: Path) -> dict:
+        """Execute phases defined in a YAML file.
+
+        Supports all context resolver types:
+          task, list_files, read_file, detect_language,
+          previous_output, literal
+
+        Supports skip_conditions: max_size_kb, text_only
+        """
+        defs = self._load_yaml_defs(yaml_path)
+        phase_outputs: dict[str, dict] = {}
+
+        for phase_def in defs.get("phases", []):
+            name = phase_def["name"]
+            batch_over = phase_def.get("batch_over")
+
+            # Resolve static context variables
+            ctx = self._resolve_yaml_context(
+                phase_def.get("context", {}), task, phase_outputs, None
+            )
+
+            if batch_over:
+                items = list(ctx.get(batch_over, []))
+                output_field = phase_def.get("output_field")
+                results = []
+
+                for item in items:
+                    safe_key = str(item).replace("/", "_").replace(".", "_")
+                    phase_name = f"{name}-{safe_key}"
+                    json_path = self.session_dir / f"{phase_name}.json"
+
+                    if json_path.exists():
+                        logger.info("Batch item '%s' already completed, resuming", phase_name)
+                        r = json.loads(json_path.read_text())
+                        r["_key"] = str(item)
+                        results.append(r)
+                        continue
+
+                    skip = phase_def.get("skip_conditions", {})
+                    if isinstance(item, str):
+                        if skip.get("text_only") and not self._is_text_file(item):
+                            logger.info("Skipping '%s': binary file", phase_name)
+                            r = {"_key": str(item), "_skipped": True, "_reason": "binary file"}
+                            self._persist_phase(phase_name, r, "(skipped)", [])
+                            results.append(r)
+                            continue
+                        if skip.get("max_size_kb") and self._file_size_kb(item) > skip["max_size_kb"]:
+                            logger.info("Skipping '%s': too large", phase_name)
+                            r = {"_key": str(item), "_skipped": True, "_reason": f"file too large ({self._file_size_kb(item)} KB)"}
+                            self._persist_phase(phase_name, r, "(skipped)", [])
+                            results.append(r)
+                            continue
+
+                    item_ctx = self._resolve_yaml_context(
+                        phase_def.get("context", {}), task, phase_outputs, item
+                    )
+                    system = phase_def.get("system_prompt", "")
+                    user = phase_def.get("user_prompt", "")
+                    if system:
+                        system = system.format(**item_ctx)
+                    if user:
+                        user = user.format(**item_ctx)
+
+                    r = await self._phase(
+                        phase_name,
+                        system=system,
+                        user=user,
+                        output_schema=phase_def.get("output_schema"),
+                    )
+                    r["_key"] = str(item)
+                    results.append(r)
+
+                phase_outputs[name] = results
+
+                if output_field:
+                    collected = []
+                    for r in results:
+                        if r.get("_skipped"):
+                            continue
+                        val = r.get(output_field)
+                        if val is not None:
+                            if isinstance(val, list):
+                                collected.extend(val)
+                            else:
+                                collected.append(val)
+                    phase_outputs[name + "_output"] = collected
+
+            else:
+                r = await self._phase(
+                    name,
+                    system=phase_def.get("system_prompt", "").format(**ctx),
+                    user=phase_def.get("user_prompt", "").format(**ctx),
+                    output_schema=phase_def.get("output_schema"),
+                )
+                phase_outputs[name] = r
+
+        return phase_outputs
+
+    def _resolve_yaml_context(self, ctx_def: dict, task: str,
+                              phase_outputs: dict, batch_item: str | None) -> dict:
+        """Resolve all context variables for a phase."""
+        resolved = {"task": task}
+
+        for key, spec in ctx_def.items():
+            ctype = spec.get("type", "literal") if isinstance(spec, dict) else "literal"
+
+            if ctype == "task":
+                resolved[key] = task
+
+            elif ctype == "list_files":
+                resolved[key] = "\n".join(self._list_files())
+
+            elif ctype == "read_file":
+                path = spec.get("path", "")
+                if "{item}" in path and batch_item is not None:
+                    path = path.replace("{item}", batch_item)
+                resolved[key] = self._read_file(path)
+
+            elif ctype == "detect_language":
+                path = spec.get("path", "")
+                if "{item}" in path and batch_item is not None:
+                    path = path.replace("{item}", batch_item)
+                resolved[key] = self._detect_language(path)
+
+            elif ctype == "previous_output":
+                phase = spec.get("phase", "")
+                aggregate = spec.get("aggregate", "json")
+                key_field = spec.get("key", "all")
+                data = phase_outputs.get(phase, [])
+
+                if aggregate == "json":
+                    items = []
+                    for item in data:
+                        if item.get("_skipped"):
+                            continue
+                        if key_field == "all":
+                            items.append(item)
+                        else:
+                            v = item.get(key_field, [])
+                            if isinstance(v, list):
+                                items.extend(v)
+                            else:
+                                items.append(v)
+                    resolved[key] = json.dumps(items, indent=2, default=str)
+
+                elif aggregate == "text":
+                    lines = []
+                    for item in data:
+                        if item.get("_skipped"):
+                            continue
+                        fp = item.get("file", item.get("_key", "?"))
+                        lines.append(f"--- {fp} ---")
+                        lines.append(f"Purpose: {item.get('purpose', '')}")
+                        lines.append(f"Symbols: {', '.join(item.get('key_symbols', []))}")
+                        lines.append(f"Deps: {', '.join(item.get('dependencies', []))}")
+                        lines.append(f"Notable: {', '.join(item.get('notable', []))}")
+                        lines.append("")
+                    resolved[key] = "\n".join(lines)
+
+            elif ctype == "literal":
+                val = spec.get("value", "")
+                if "{item}" in val and batch_item is not None:
+                    val = val.replace("{item}", batch_item)
+                resolved[key] = val
+
+        return resolved
+
+
     # ── Subclass hook ───────────────────────────────────────────────────
 
     async def _run(self, task: str) -> dict:
@@ -346,6 +560,15 @@ async def _main():
         result = await pipe.run(args.task, session_id=args.session_id,
                                 resume=args.resume)
         print(json.dumps(result, indent=2, default=str))
+    except KeyboardInterrupt:
+        print("\nInterrupted. Session can be resumed with --session-id %s --resume",
+              pipe.session_id if pipe.session_id else "")
+        sys.exit(130)
+    except Exception as e:
+        logger.error("Pipeline failed: %s", e)
+        sid = pipe.session_id if pipe.session_id else ""
+        print(json.dumps({"error": str(e), "session_id": sid}, indent=2))
+        sys.exit(1)
     finally:
         await pipe.close()
 
