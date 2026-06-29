@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+"""Pipeline framework — multi-phase LLM orchestration with persistent working memory.
+
+Each pipeline runs as a sequence of phases. Phases can be:
+- Single LLM call with structured output
+- Batch over items from a previous phase (sequential, one LLM call per item)
+
+All phase outputs are persisted to .context/<session_id>/ for crash recovery,
+resume, and inspection.  Pipeline only touches paths under config.workspace.path
+and config.context.path (defaults to workspace/.context).
+"""
+
+import asyncio
+import json
+import logging
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Optional, Callable
+
+from config import config
+from ollama_client import OllamaClient
+
+logger = logging.getLogger(__name__)
+
+SANDBOX_ROOT = Path(config.workspace.path).resolve()
+
+
+def _safe_path(resource: str) -> Path:
+    """Resolve a workspace-relative path, ensuring it stays inside the sandbox."""
+    p = (SANDBOX_ROOT / resource).resolve()
+    if not str(p).startswith(str(SANDBOX_ROOT)):
+        raise ValueError(f"Path '{resource}' resolves outside sandbox ({p})")
+    return p
+
+
+# ── Base Pipeline ──────────────────────────────────────────────────────────
+
+class Pipeline:
+    """Base class for multi-phase analysis workflows.
+
+    Subclasses override `_run(task)` to orchestrate phases using:
+      - self._phase()      — single LLM call
+      - self._phase_batch()— one LLM call per item (sequential)
+      - self._read_file()  — safe file read within workspace
+
+    Each phase is persisted to .context/<session_id>/<name>.json + .md.
+    Resume is automatic: already-completed phases are skipped.
+    """
+
+    name: str = "unnamed"
+    description: str = ""
+
+    def __init__(self):
+        self.ollama = OllamaClient()
+
+        ctx_path = getattr(config, "context", None)
+        if ctx_path and hasattr(ctx_path, "path"):
+            self.context_path = Path(ctx_path.path)
+        else:
+            self.context_path = Path(config.workspace.path) / ".context"
+        self.context_path.mkdir(parents=True, exist_ok=True)
+
+        self.session_id: str = ""
+        self.session_dir: Path = Path()
+        self.manifest: dict = {}
+        self._tokens_used: int = 0
+
+    # ── Public API ──────────────────────────────────────────────────────
+
+    async def run(self, task: str, session_id: Optional[str] = None,
+                  resume: bool = False) -> dict:
+        """Execute the pipeline.  Creates or resumes a session."""
+        self.session_id = session_id or uuid.uuid4().hex[:12]
+        self.session_dir = self.context_path / self.session_id
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+
+        manifest_path = self.session_dir / "manifest.json"
+        if resume and manifest_path.exists():
+            self.manifest = json.loads(manifest_path.read_text())
+            logger.info("Resumed session %s (%d phases done)",
+                        self.session_id, len(self.manifest.get("completed_phases", [])))
+        else:
+            self.manifest = {
+                "session_id": self.session_id,
+                "workflow": self.name,
+                "task": task[:500],
+                "created_at": datetime.now().isoformat(),
+                "completed_phases": [],
+                "tokens_used": 0,
+                "status": "running",
+            }
+        self._save_manifest()
+
+        try:
+            result = await self._run(task)
+            self.manifest["status"] = "complete"
+            self.manifest["tokens_used"] = self._tokens_used
+            self._save_manifest()
+            return result
+        except Exception:
+            self.manifest["status"] = "failed"
+            self._save_manifest()
+            raise
+
+    async def close(self):
+        await self.ollama.close()
+
+    # ── Phase helpers (to be called from _run) ──────────────────────────
+
+    async def _phase(self, name: str, system: Optional[str] = None,
+                     user: Optional[str] = None,
+                     output_schema: Optional[dict] = None,
+                     force: bool = False) -> dict:
+        """Run a single LLM phase.  Skips if already completed (unless force)."""
+        json_path = self.session_dir / f"{name}.json"
+
+        if not force and json_path.exists():
+            logger.info("Phase '%s' already completed, skipping", name)
+            return json.loads(json_path.read_text())
+
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        if user:
+            final_user = user
+            if output_schema:
+                # Build example from schema to show the model what we want
+                example = self._schema_to_example(output_schema)
+                schema_hint = (
+                    "\n\nRespond ONLY with valid JSON. "
+                    "Here is the required structure — output DATA following this shape, "
+                    "not the schema definition itself:\n\n"
+                    f"{json.dumps(example, indent=2)}\n"
+                )
+                final_user += schema_hint
+            messages.append({"role": "user", "content": final_user})
+
+        fmt = "json" if output_schema else None
+        response = await self.ollama.chat(messages, format=fmt)
+        content = response.get("message", {}).get("content", "")
+
+        result = self._parse_output(content, output_schema)
+
+        self._persist_phase(name, result, content, messages)
+        return result
+
+    async def _phase_batch(self, name_prefix: str, items: list,
+                           prepare_fn: Callable[[Any], dict],
+                           output_schema: Optional[dict] = None,
+                           item_key_fn: Optional[Callable[[Any], str]] = None) -> list[dict]:
+        """Run one LLM call per *item* sequentially.
+
+        *prepare_fn(item)* returns *dict* with keys ``system``, ``user``.
+        Each batch item is persisted as ``<name>-<key>.json`` for resume.
+        """
+        results = []
+        if item_key_fn is None:
+            item_key_fn = lambda x: str(x).replace("/", "_").replace(".", "_")
+
+        for item in items:
+            key = item_key_fn(item)
+            phase_name = f"{name_prefix}-{key}"
+            json_path = self.session_dir / f"{phase_name}.json"
+
+            if json_path.exists():
+                logger.info("Batch item '%s' already completed, resuming", phase_name)
+                results.append(json.loads(json_path.read_text()))
+                continue
+
+            prompts = prepare_fn(item)
+            result = await self._phase(
+                phase_name,
+                system=prompts.get("system"),
+                user=prompts.get("user"),
+                output_schema=output_schema,
+            )
+            result["_key"] = str(item)
+            results.append(result)
+
+        return results
+
+    # ── File I/O (sandbox-constrained) ──────────────────────────────────
+
+    def _list_files(self, subdir: str = "") -> list[str]:
+        """Return all file paths under a workspace subdir, relative to workspace.
+        Excludes hidden directories (starting with '.') to avoid .context, .session-log, .wiki.
+        """
+        root = _safe_path(subdir) if subdir else SANDBOX_ROOT
+        files = []
+        for p in sorted(root.rglob("*")):
+            if not p.is_file():
+                continue
+            # Skip files inside hidden directories
+            parts = p.relative_to(SANDBOX_ROOT).parts
+            if any(part.startswith(".") for part in parts):
+                continue
+            rel = p.relative_to(SANDBOX_ROOT)
+            files.append(str(rel))
+        return files
+
+    def _read_file(self, rel_path: str) -> str:
+        full = _safe_path(rel_path)
+        return full.read_text()
+
+    def _detect_language(self, path: str) -> str:
+        ext = Path(path).suffix.lower()
+        return {
+            ".go": "Go",
+            ".py": "Python",
+            ".js": "JavaScript",
+            ".ts": "TypeScript",
+            ".rs": "Rust",
+            ".c": "C",
+            ".h": "C",
+            ".cpp": "C++",
+            ".hpp": "C++",
+            ".java": "Java",
+            ".rb": "Ruby",
+            ".sh": "Shell",
+            ".yaml": "YAML",
+            ".yml": "YAML",
+            ".json": "JSON",
+            ".md": "Markdown",
+            ".toml": "TOML",
+            ".mod": "Go Module",
+            ".sum": "Go Sum",
+        }.get(ext, "Text")
+
+    # ── Internals ───────────────────────────────────────────────────────
+
+    def _schema_to_example(self, schema: dict) -> dict:
+        """Build a plausible example dict from a JSON schema."""
+        example = {}
+        for key, props in schema.get("properties", {}).items():
+            ptype = props.get("type", "string")
+            if ptype == "array":
+                item_type = props.get("items", {}).get("type", "string")
+                if item_type == "string":
+                    example[key] = [f"<{key.rstrip('s')}_1>", f"<{key.rstrip('s')}_2>"]
+                else:
+                    example[key] = []
+            elif ptype == "object":
+                example[key] = {}
+            elif ptype == "number":
+                example[key] = 0
+            elif ptype == "boolean":
+                example[key] = False
+            else:
+                example[key] = f"<{key}>"
+        return example
+
+    def _parse_output(self, content: str, schema: Optional[dict]) -> dict:
+        if not content:
+            return {"raw": ""}
+        if not schema:
+            return {"raw": content}
+        try:
+            parsed = json.loads(content)
+            if isinstance(parsed, dict):
+                # Recover if the model echoed the schema itself
+                if "properties" in parsed and "type" in parsed:
+                    recovered = {}
+                    for k, v in parsed["properties"].items():
+                        if isinstance(v, dict) and "items" in v:
+                            recovered[k] = v.get("value") or v.get("items", {}).get("value") or []
+                        elif isinstance(v, dict) and v.get("type") == "array":
+                            recovered[k] = v.get("value") or []
+                        elif isinstance(v, str):
+                            recovered[k] = v
+                    return recovered
+                return parsed
+            return {"data": parsed}
+        except json.JSONDecodeError:
+            return {"raw": content, "_parse_error": "response was not valid JSON"}
+
+    def _persist_phase(self, name: str, result: dict, raw_content: str,
+                       messages: list):
+        json_path = self.session_dir / f"{name}.json"
+        md_path = self.session_dir / f"{name}.md"
+        md_body = raw_content or "(no output)"
+
+        json_path.write_text(json.dumps(result, indent=2, default=str))
+        md_path.write_text(f"# {name}\n\n{md_body}\n")
+
+        if name not in self.manifest["completed_phases"]:
+            self.manifest["completed_phases"].append(name)
+        self._save_manifest()
+
+        self._append_conversation({
+            "role": "sys",
+            "phase": name,
+            "summary": raw_content[:200] if raw_content else "(no output)",
+        })
+
+    def _save_manifest(self):
+        (self.session_dir / "manifest.json").write_text(
+            json.dumps(self.manifest, indent=2)
+        )
+
+    def _append_conversation(self, entry: dict):
+        conv_path = self.session_dir / "conversation.jsonl"
+        entry["t"] = datetime.now().isoformat()
+        with open(conv_path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+
+    # ── Subclass hook ───────────────────────────────────────────────────
+
+    async def _run(self, task: str) -> dict:
+        raise NotImplementedError
+
+
+# ── CLI entry point ────────────────────────────────────────────────────────
+
+async def _main():
+    import argparse
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+
+    parser = argparse.ArgumentParser(description="Run a multi-phase analysis pipeline")
+    parser.add_argument("--workflow", help="Workflow name")
+    parser.add_argument("--task", help="Task description")
+    parser.add_argument("--session-id", help="Session ID (for resume)")
+    parser.add_argument("--resume", action="store_true", help="Resume existing session")
+    parser.add_argument("--list", action="store_true", help="List available workflows")
+    args = parser.parse_args()
+
+    # Lazy import so workflows register
+    from workflows import get_workflow, list_workflows
+
+    if args.list:
+        print("Available workflows:")
+        for name, desc in list_workflows().items():
+            print(f"  {name}: {desc}")
+        return
+
+    if not args.workflow or not args.task:
+        parser.print_help()
+        sys.exit(1)
+
+    pipe = get_workflow(args.workflow)
+    try:
+        result = await pipe.run(args.task, session_id=args.session_id,
+                                resume=args.resume)
+        print(json.dumps(result, indent=2, default=str))
+    finally:
+        await pipe.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(_main())

@@ -1,0 +1,21 @@
+scout:
+  host: "localhost"
+  port: 8080
+  base_url: "http://localhost:8080/cgi-bin/mcp/tools"
+
+ollama:
+  host: "localhost"
+  port: 11434
+  model: "huihui_ai/qwen3.5-abliterated:9b"
+  timeout: 300
+
+workspace:
+  path: "/home/scout/projects/sandbox/workspace"
+  wiki_path: "/home/scout/projects/sandbox/workspace/.wiki"
+
+agent:
+  max_turns: 20
+  temperature: 0.1
+
+context:
+  path: "/home/scout/projects/sandbox/workspace/.context"
