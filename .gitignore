@@ -17,4 +17,5 @@ workspace/.context/
 
 # Python cache
 __pycache__/
-*.pycworkspace/simplesieve
+*.pyc
+workspace/simplesieve

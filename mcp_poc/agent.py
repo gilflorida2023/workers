@@ -15,7 +15,18 @@ from tool_wiki import ToolWiki
 from context_manager import ContextManager
 from session_log import SessionLogger
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+log_dir = Path(config.workspace.path) / ".session-log"
+log_dir.mkdir(parents=True, exist_ok=True)
+root = logging.getLogger()
+for h in root.handlers[:]:
+    root.removeHandler(h)
+handler = logging.FileHandler(str(log_dir / "agent.log"))
+handler.setFormatter(logging.Formatter(
+    "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+))
+root.addHandler(handler)
+root.setLevel(logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 def _parse_text_tool_calls(content: str) -> list[dict]:

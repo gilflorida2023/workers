@@ -13,6 +13,7 @@ and config.context.path (defaults to workspace/.context).
 import asyncio
 import json
 import logging
+import sys
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +21,8 @@ from typing import Any, Optional, Callable
 
 from config import config
 from ollama_client import OllamaClient
+from rich.console import Console
+from rich.markdown import Markdown
 
 logger = logging.getLogger(__name__)
 
@@ -559,10 +562,18 @@ class Pipeline:
 async def _main():
     import argparse
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
+    log_dir = Path(config.workspace.path) / ".session-log"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    root = logging.getLogger()
+    for h in root.handlers[:]:
+        root.removeHandler(h)
+    handler = logging.FileHandler(str(log_dir / "pipeline.log"))
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    ))
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
     parser = argparse.ArgumentParser(description="Run a multi-phase analysis pipeline")
     parser.add_argument("--workflow", help="Workflow name")
@@ -589,7 +600,25 @@ async def _main():
     try:
         result = await pipe.run(args.task, session_id=args.session_id,
                                 resume=args.resume)
-        print(json.dumps(result, indent=2, default=str))
+
+        console = Console()
+
+        # Render markdown output if present
+        blob_path = result.get("context_blob_path")
+        if blob_path and Path(blob_path).exists():
+            console.print(Markdown(Path(blob_path).read_text()))
+        elif "synthesis" in result:
+            synth = result["synthesis"]
+            if isinstance(synth, dict):
+                report = synth.get("report", "")
+                if report:
+                    console.print(Markdown(report))
+
+        # Compact status line
+        sid = result.get("session_id", pipe.session_id)
+        files = result.get("files_summarized") or result.get("files_analyzed") or []
+        suffix = f"  [green]✓[/green] {len(files)} files" if files else ""
+        console.print(f"[dim]session[/dim] {sid}  [dim]workflow[/dim] {args.workflow}{suffix}")
     except KeyboardInterrupt:
         print("\nInterrupted. Session can be resumed with --session-id %s --resume",
               pipe.session_id if pipe.session_id else "")
