@@ -79,6 +79,30 @@ case "$TOOL_NAME" in
     arena.tool_prove)
         /home/scout/projects/workers/scout/cgi-bin/arena/tool_prove.sh <<< "$ARGS"
         ;;
+    workspace.read)
+        /home/scout/projects/sandbox/scout/cgi-bin/workspace/read.sh <<< "$ARGS"
+        ;;
+    workspace.write)
+        /home/scout/projects/sandbox/scout/cgi-bin/workspace/write.sh <<< "$ARGS"
+        ;;
+    workspace.list)
+        /home/scout/projects/sandbox/scout/cgi-bin/workspace/list.sh <<< "$ARGS"
+        ;;
+    workspace.delete)
+        /home/scout/projects/sandbox/scout/cgi-bin/workspace/delete.sh <<< "$ARGS"
+        ;;
+    workspace.compile)
+        /home/scout/projects/sandbox/scout/cgi-bin/workspace/compile.sh <<< "$ARGS"
+        ;;
+    workspace.run)
+        /home/scout/projects/sandbox/scout/cgi-bin/workspace/run.sh <<< "$ARGS"
+        ;;
+    workspace.search)
+        /home/scout/projects/sandbox/scout/cgi-bin/workspace/search.sh <<< "$ARGS"
+        ;;
+    wiki.lookup)
+        /home/scout/projects/sandbox/scout/cgi-bin/workspace/wiki_lookup.sh <<< "$ARGS"
+        ;;
     *)
         echo '{"success":false,"error":"Unknown tool: '"$TOOL_NAME"'","retryable":false}'
         exit 1

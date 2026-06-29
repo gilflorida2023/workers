@@ -372,7 +372,22 @@ class Pipeline:
             )
 
             if batch_over:
-                items = list(ctx.get(batch_over, []))
+                # Resolve batch items: first check phase_outputs, then context, then previous phase
+                items = []
+                # Check if the batch_over field exists in phase_outputs
+                for prev_name, prev_data in reversed(list(phase_outputs.items())):
+                    if isinstance(prev_data, dict) and batch_over in prev_data:
+                        items = list(prev_data[batch_over])
+                        break
+                if not items:
+                    items = list(ctx.get(batch_over, []))
+                if not items:
+                    # Try previous phase with _output suffix
+                    for prev_name in reversed(list(phase_outputs.keys())):
+                        check = prev_name + "_output"
+                        if check in phase_outputs:
+                            items = list(phase_outputs[check])
+                            break
                 output_field = phase_def.get("output_field")
                 results = []
 
@@ -446,6 +461,15 @@ class Pipeline:
                 )
                 phase_outputs[name] = r
 
+                output_field = phase_def.get("output_field")
+                if output_field:
+                    val = r.get(output_field)
+                    if val is not None:
+                        if isinstance(val, list):
+                            phase_outputs[name + "_output"] = list(val)
+                        else:
+                            phase_outputs[name + "_output"] = [val]
+
         return phase_outputs
 
     def _resolve_yaml_context(self, ctx_def: dict, task: str,
@@ -464,13 +488,17 @@ class Pipeline:
 
             elif ctype == "read_file":
                 path = spec.get("path", "")
-                if "{item}" in path and batch_item is not None:
+                if "{item}" in path:
+                    if batch_item is None:
+                        continue  # deferred to per-item resolution
                     path = path.replace("{item}", batch_item)
                 resolved[key] = self._read_file(path)
 
             elif ctype == "detect_language":
                 path = spec.get("path", "")
-                if "{item}" in path and batch_item is not None:
+                if "{item}" in path:
+                    if batch_item is None:
+                        continue  # deferred to per-item resolution
                     path = path.replace("{item}", batch_item)
                 resolved[key] = self._detect_language(path)
 
@@ -511,7 +539,9 @@ class Pipeline:
 
             elif ctype == "literal":
                 val = spec.get("value", "")
-                if "{item}" in val and batch_item is not None:
+                if "{item}" in val:
+                    if batch_item is None:
+                        continue  # deferred to per-item resolution
                     val = val.replace("{item}", batch_item)
                 resolved[key] = val
 

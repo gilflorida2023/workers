@@ -29,7 +29,15 @@ cat << 'TOOLS'
     {"name": "arena.status", "description": "Get worker status and history", "input_schema": {"type": "object", "properties": {"worker_id": {"type": "string"}}}},
     {"name": "arena.match_result", "description": "Get last match result for a worker", "input_schema": {"type": "object", "properties": {"worker_id": {"type": "string"}}}},
     {"name": "arena.run_match", "description": "Run a full match between two workers", "input_schema": {"type": "object", "properties": {"worker1_host": {"type": "string"}, "worker2_host": {"type": "string"}, "model": {"type": "string"}}}},
-    {"name": "arena.tool_prove", "description": "Proving ground: test worker agents' ability to compile and run code to answer a question", "input_schema": {"type": "object", "properties": {"worker1_host": {"type": "string"}, "worker2_host": {"type": "string"}, "model": {"type": "string"}}}}
+    {"name": "arena.tool_prove", "description": "Proving ground: test worker agents' ability to compile and run code to answer a question", "input_schema": {"type": "object", "properties": {"worker1_host": {"type": "string"}, "worker2_host": {"type": "string"}, "model": {"type": "string"}}}},
+    {"name": "workspace.read", "description": "Read a file from workspace", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
+    {"name": "workspace.write", "description": "Write a file to workspace", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
+    {"name": "workspace.list", "description": "List files in workspace directory", "input_schema": {"type": "object", "properties": {"path": {"type": "string", "default": "."}}}},
+    {"name": "workspace.delete", "description": "Delete file or directory from workspace", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "recursive": {"type": "boolean", "default": false}}, "required": ["path"]}},
+    {"name": "workspace.compile", "description": "Compile source code (Go, Python, C, C++, Rust)", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "language": {"type": "string", "enum": ["go", "python", "c", "cpp", "rust", "auto"], "default": "auto"}}, "required": ["path"]}},
+    {"name": "workspace.run", "description": "Run executable or script in workspace", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "args": {"type": "array", "items": {"type": "string"}, "default": []}, "timeout": {"type": "integer", "default": 30}}, "required": ["path"]}},
+    {"name": "workspace.search", "description": "Search code with grep", "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}, "path": {"type": "string", "default": "."}, "file_pattern": {"type": "string"}, "context_lines": {"type": "integer", "default": 2}}, "required": ["pattern"]}},
+    {"name": "wiki.lookup", "description": "Look up tool or guide documentation", "input_schema": {"type": "object", "properties": {"topic": {"type": "string"}}, "required": ["topic"]}}
   ]
 }
 TOOLS

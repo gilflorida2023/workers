@@ -1,206 +1,363 @@
-# Prime Forge — Coevolutionary Code Arena
+# MCP + Ollama Coding Agent — Proof of Concept
 
-Two AI worker agents (LLMs via Ollama) compete to optimize a prime sieve algorithm in a Git-audited competitive arena. Each worker iteratively improves `internal/sieve/sieve.go`, submits code, and is scored on originality, correctness, speed, and memory vs a shared baseline. Winners advance through tiered problem difficulties.
+An LLM-powered coding agent that runs on a **Linux host** (scout) and uses **Ollama on an Apple M4 Mac** for reasoning, with tool access via a **CGI-based MCP server**. The agent manages a workspace for file operations, compilation, and execution.
 
 ## Architecture
 
 ```
-┌─────────────┐     ┌──────────────────────────────┐     ┌──────────┐
-│  Ollama W1  │────▶│  Scout Server (Go :8080)      │◀────│ Ollama W2│
-│  worker1    │     │  ├─ CGI dispatcher            │     │ worker2  │
-│  :11434     │     │  ├─ arena/ (8 CGI scripts)    │     │ :11434   │
-└─────────────┘     │  ├─ mcp/tools/ (tool registry)│     └──────────┘
-                    │  ├─ /status, /events, /health  │
-                    │  └─ Git sandbox per worker     │
-                    └──────────────────────────────┘
-                             │
-                    ┌────────▼────────┐
-                    │  Leaderboard    │
-                    │  (JSON file)    │
-                    └─────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  Mac M4 (192.168.0.7)                  Ollama :11434            │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  qwen2.5-coder:7b                                        │   │
+│  │  (LLM reasoning + tool calling)                          │   │
+│  └──────────────────────┬───────────────────────────────────┘   │
+│                         │ SSH tunnel                            │
+│                         │ -L 11434:localhost:11434               │
+└─────────────────────────┼───────────────────────────────────────┘
+                          │
+┌─────────────────────────┼───────────────────────────────────────┐
+│  Scout (Linux host)     │                                        │
+│                         ▼                                        │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  Python Agent (mcp_poc/agent.py)                         │   │
+│  │  ┌─────────────┐  ┌──────────────┐  ┌───────────────┐  │   │
+│  │  │ OllamaClient│  │ MCPClient    │  │ ContextManager│  │   │
+│  │  │ localhost   │  │ localhost    │  │ (history +    │  │   │
+│  │  │ :11434      │  │ :8080/tools  │  │  wiki)        │  │   │
+│  │  └──────┬──────┘  └──────┬───────┘  └───────────────┘  │   │
+│  └─────────┼────────────────┼─────────────────────────────┘   │
+│            │                │                                  │
+│  ┌─────────▼────────────────▼─────────────────────────────┐   │
+│  │  Scout CGI MCP Server (Go :8080)                       │   │
+│  │  ├─ mcp/tools/list.sh   (tool registry)                │   │
+│  │  ├─ mcp/tools/call.sh   (tool dispatcher)              │   │
+│  │  ├─ workspace/*.sh      (8 CGI tool scripts)           │   │
+│  │  └─ /health, /status, /events                          │   │
+│  └────────────────────────────────────────────────────────┘   │
+│            │                                                  │
+│  ┌─────────▼─────────────────────────────────────────────┐   │
+│  │  Workspace (/home/scout/projects/sandbox/workspace/)  │   │
+│  │  ├─ .wiki/index.json     (tool/guide registry)        │   │
+│  │  ├─ .wiki/tools/*.md     (7 tool documentation)       │   │
+│  │  └─ .wiki/guides/*.md    (4 guides)                   │   │
+│  └────────────────────────────────────────────────────────┘   │
+└────────────────────────────────────────────────────────────────┘
 ```
 
-The Scout server runs on port 8080 and dispatches tool calls to CGI shell scripts. Worker agents connect via Ollama's `/api/chat` with tool calling support.
+### Data Flow
+
+1. **User** gives a task to the Python agent
+2. **Agent** sends conversation (system prompt + user task + history) to Ollama via `/api/chat`
+3. **Ollama** reasons and either returns text (answer) or a tool call as JSON in `content`
+4. **Agent** parses tool calls, executes them via Scout's CGI MCP tools (`POST /cgi-bin/mcp/tools/call.sh`)
+5. **Tool results** are appended to the conversation and sent back to Ollama for the next turn
+6. Loop continues until Ollama returns a natural language response (no tool call)
+
+### Current Limitations vs. Classical MCP
+
+This PoC implements a **minimal MCP protocol** over CGI. A full MCP implementation would include:
+
+| Layer | Current | Classical MCP |
+|-------|---------|---------------|
+| **Input Validation** | None — CGI scripts parse JSON ad-hoc with `grep`/`sed` | Schema validation (JSON Schema / Pydantic) at server boundary; reject malformed requests before dispatch |
+| **Context Management** | Client-side `context_manager.py` tracks history | Server manages session state, TTL, and context lifecycle; supports resume, timeout, and eviction |
+| **Context Formatting & Serialization** | Hand-rolled JSON in bash CGI scripts; fragile escaping (`sed` for JSON-safe strings) | Standard MCP envelope (`jsonrpc`), typed content blocks, content negotiation, streaming |
+| **Resource Allocation** | Unlimited concurrent tool calls, no quotas | Rate limiting, concurrency slots, per-session resource budgets, cancellation |
+| **Access Control** | None — open HTTP on :8080, no auth | Capability-based security, OAuth/API keys, per-tool ACL, audit logging |
+| **Tool Discovery** | Static JSON array in `list.sh` | Dynamic registration, tool versioning, capability negotiation |
+| **Transport** | HTTP POST with raw JSON body | Multiple transports: stdio, SSE, WebSocket; request batching |
+
+For a production system these gaps would need to be addressed, particularly **access control** and **input validation** before exposing the server beyond localhost.
 
 ## Project Structure
 
 ```
-scout/                          # Scout server (Go, CGI)
-├── scout.go                    # Server entry point (port 8080)
-├── start_scout.sh              # Initialize arena + start server
-├── bin/scout                   # Compiled server binary
+mcp_poc/                          # Python agent (PoC)
+├── agent.py                      # Main loop: Ollama → tool call → execute → repeat
+├── config.yaml                   # Scout, Ollama, Workspace configuration
+├── config.py                     # Config loader (dataclasses from YAML)
+├── mcp_client.py                 # HTTP client → Scout CGI /mcp/tools
+├── ollama_client.py              # HTTP client → Ollama /api/chat
+├── tool_wiki.py                  # Wiki index + tool/guide doc loader
+├── context_manager.py            # Conversation history + context extraction
+├── prompts/system_prompt.txt     # Agent system instructions
+├── requirements.txt              # Python dependencies (mcp, httpx, pyyaml, rich)
+└── venv/                         # Virtual environment
+
+scout/                            # Scout CGI server (Go)
+├── bin/scout                     # Compiled server binary (port 8080)
+├── scout.go                      # Source — CGI handler, sessions, HTTP routing
+├── start_scout.sh                # Init script (arena-focused — use manual start)
 ├── cgi-bin/
 │   ├── mcp/tools/
-│   │   ├── list.sh             # Tool definitions (35+ tools)
-│   │   └── call.sh             # Tool routing to CGI scripts
-│   └── arena/
-│       ├── get_context.sh      # Return baseline code + tier info
-│       ├── read_file.sh        # Read worker sandbox file
-│       ├── write_file.sh       # Write worker sandbox file
-│       ├── submit.sh           # Git-commit worker code
-│       ├── run_match.sh        # Full match orchestrator
-│       ├── leaderboard.sh      # Return leaderboard.json
-│       ├── status.sh           # Worker status + history
-│       └── match_result.sh     # Last match result
-├── contexts/arena/
-│   ├── baseline/               # Reference sieve implementation (Go module)
-│   │   ├── main.go             # CLI entry point (stable, worker-visible)
-│   │   ├── go.mod              # module simplesieve
-│   │   └── internal/sieve/sieve.go  # Sieve algorithm (worker-editable)
-│   ├── worker1/                # Git sandbox for worker 1
-│   ├── worker2/                # Git sandbox for worker 2
-│   ├── tier.json               # Current problem tier
-│   └── matches.jsonl           # Match history
-├── leaderboard.json            # Persistent leaderboard state
-└── locks/                      # Flock-based mutexes
+│   │   ├── list.sh               # Tool definitions (8 workspace/wiki tools)
+│   │   └── call.sh               # Routes tool name → workspace/*.sh script
+│   └── workspace/
+│       ├── list.sh               # workspace.list — list directory
+│       ├── read.sh               # workspace.read — read file
+│       ├── write.sh              # workspace.write — write file
+│       ├── delete.sh             # workspace.delete — remove file/dir
+│       ├── compile.sh            # workspace.compile — build code (go, python, c, cpp, rust)
+│       ├── run.sh                # workspace.run — execute binary/script
+│       ├── search.sh             # workspace.search — grep code
+│       └── wiki_lookup.sh        # wiki.lookup — docs lookup
+├── contexts/arena/               # (Legacy — arena sandboxes, not used by PoC)
+├── locks/                        # Flock-based mutexes
+├── logs/                         # Server logs
+└── sessions/                     # Session state (JSON files)
+
+workspace/                        # Agent workspace root
+├── .wiki/
+│   ├── index.json                # Tool + guide registry
+│   ├── tools/                    # Tool docs (Markdown)
+│   │   ├── read_file.md
+│   │   ├── write_file.md
+│   │   ├── list_files.md
+│   │   ├── delete_file.md
+│   │   ├── compile.md
+│   │   ├── run.md
+│   │   ├── search.md
+│   │   └── wiki_lookup.md
+│   └── guides/                   # Guides (Markdown)
+│       ├── getting_started.md
+│       ├── go_development.md
+│       ├── python_development.md
+│       └── searching_code.md
+└── (your project files go here)
 
 services/ollama_client/ollama/
-└── chat.go                     # Go ChatClient for Ollama /api/chat
+└── chat.go                     # Go ChatClient for Ollama /api/chat (reference only)
 ```
 
-## Start / Stop
+## Prerequisites
 
-### Start Scout Server
+- **Ollama** running on a host with a tool-capable model (e.g., `qwen2.5-coder:7b`)
+- **Go 1.21+** (to build scout, or use the prebuilt binary)
+- **Python 3.13+** for the agent
+
+### Model Setup
+
+Pull a tool-capable model on the Mac:
 
 ```bash
-cd /home/scout/projects/workers
-./scout/start_scout.sh
+ollama pull qwen2.5-coder:7b
 ```
 
-This seeds the baseline from `~/projects/simplesieve/`, initializes worker git repos, creates `tier.json` and `leaderboard.json`, builds `scout.go` if needed, then starts the server on port 8080.
+## Start Commands
 
-### Manual Start (if already initialized)
+All commands run on the **scout (Linux host)** unless noted.
+
+### 1. Start Scout CGI Server
 
 ```bash
 cd /home/scout/projects/workers/scout
 nohup ./bin/scout > scout.log 2>&1 &
-echo $! > scout.pid
 ```
 
-### Stop
-
-```bash
-kill $(cat /home/scout/projects/workers/scout/scout.pid) 2>/dev/null
-# or
-pkill -f "scout/bin/scout"
-```
-
-### Verify
+Verify it's running:
 
 ```bash
 curl http://localhost:8080/health
-# → {"status":"ok","service":"scout-cgi-mcp","version":"1.0.0"}
+```
+Expected: `{"service":"scout-cgi-mcp","status":"ok","version":"1.0.0"}`
+
+### 2. SSH Tunnel to Mac Ollama
+
+Ollama on the Mac listens only on `localhost:11434`. Forward it to scout:
+
+```bash
+ssh -L 11434:localhost:11434 m4@192.168.0.7 -N -f
 ```
 
-## Problem Tiers
+If port **11434** is already in use (e.g. after a dropped session), kill the stale process and retry:
 
-| Tier | Limit | Primes | KAT Hash (SHA-256) |
-|------|-------|--------|---------------------|
-| min | 100 | 25 | `258e13d8...` |
-| ci_smoke | 1000 | 168 | `55542ac8...` |
-| dev | 100000 | 9592 | `448c035b...` |
+```bash
+kill -9 $(lsof -ti:11434)
+ssh -L 11434:localhost:11434 m4@192.168.0.7 -N -f
+```
 
-Workers start at `min` and advance to harder tiers by winning matches.
+Verify:
 
-## MCP Tools
+```bash
+curl http://localhost:11434/api/tags
+```
+Expected: A list of models including `qwen2.5-coder:7b`
 
-The Scout server exposes tools via two mechanisms:
+### 3. Install Python Dependencies
 
-### Arena Tools (for LLM worker agents in `run_match.sh`)
+```bash
+cd /home/scout/projects/sandbox/mcp_poc
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
 
-These six tools are presented to each Ollama agent as OpenAI-compatible function definitions:
+### 4. Run the Agent
+
+```bash
+cd /home/scout/projects/sandbox/mcp_poc
+source venv/bin/activate
+python agent.py "Your coding task here"
+```
+
+## Usage Examples
+
+| Command | What Happens |
+|---------|-------------|
+| `python agent.py "List files in workspace"` | Calls `workspace.list` |
+| `python agent.py "Read the getting_started guide"` | Calls `wiki.lookup` |
+| `python agent.py "Create hello.py that prints Fibonacci"` | Calls `workspace.write` then `workspace.run` |
+| `python agent.py "Search for 'TODO' in workspace"` | Calls `workspace.search` |
+| `python agent.py "Read hello.py and explain it"` | Calls `workspace.read` |
+
+## Available Tools
 
 | Tool | Description |
 |------|-------------|
-| `read_file(path)` | Read a source file (`internal/sieve/sieve.go`, `main.go`, `go.mod`) |
-| `write_file(path, content)` | Write/modify a source file |
-| `compile()` | `go build` the sandbox; returns errors or success |
-| `run(limit)` | Execute the compiled sieve; returns KAT hash, duration, memory, prime count |
-| `submit_for_match()` | Git-commit the current code as the match entry |
-| `get_leaderboard()` | Return current standings |
+| `workspace.read` | Read a file from workspace |
+| `workspace.write` | Write a file to workspace |
+| `workspace.list` | List directory contents |
+| `workspace.delete` | Delete a file or directory |
+| `workspace.compile` | Compile source code (Go, Python, C, C++, Rust) |
+| `workspace.run` | Execute a binary or script |
+| `workspace.search` | Search code with grep |
+| `wiki.lookup` | Look up tool or guide documentation |
 
-### Full MCP Tool Registry (via `mcp/tools/list.sh`)
+## Extending: Adding New Tools
 
-All tools accessible via `POST /cgi-bin/mcp/tools/call.sh`:
+To add a new tool (e.g., `git.status`):
 
-- **worker1.*** / **worker2.*** / **baseline.*** — compile, run, verify, config for each worker binary
-- **kat_verify.verify** — verify a KAT hash against the manifest
-- **manifest.get** — return `A000040.json` manifest
-- **judge.heuristic** — heuristic judge for worker results
-- **arena.get_context** — baseline code, tier info, leaderboard
-- **arena.read_file** / **arena.write_file** — sandbox file access by worker_id
-- **arena.submit** — git-commit and return diff stats
-- **arena.leaderboard** / **arena.status** / **arena.match_result** — state queries
-- **arena.run_match** — orchestrate a full match (workers, Ollama hosts, model)
+### 1. Create the CGI script
 
-## How Models Use Tools
-
-1. **Tool registration**: `run_match.sh` sends an Ollama `/api/chat` request with `tools` parameter containing the 6 agent tools as OpenAI function definitions.
-
-2. **Agent loop**: The model responds with either:
-   - **Text content** → treated as final response, loop ends
-   - **Tool call** → `run_match.sh` executes the tool via `execute_tool()`, appends result as a `"role":"tool"` message, and continues the conversation
-
-3. **Tool dispatch**: `execute_tool()` maps tool names to CGI scripts:
-   - `read_file` → `read_file.sh` (reads sandbox file via stdin JSON)
-   - `write_file` → `write_file.sh` (writes sandbox file)
-   - `compile` → runs `go build` in worker sandbox directory
-   - `run` → executes compiled binary with `-limit` flag, captures stdout (KAT hash) and stderr (JSON metrics)
-   - `submit_for_match` → `submit.sh` (git-commit, return diff stats)
-   - `get_leaderboard` → `leaderboard.sh`
-
-4. **Max turns**: The agent gets 30 tool-calling turns per match. After submission or max turns, the loop ends and scoring begins.
-
-5. **External clients** (non-arena): Call `POST /cgi-bin/mcp/tools/call.sh` with `{"name":"<tool_name>","arguments":{...}}` and receive JSON responses. Sessions are tracked via `scout_session` cookie.
-
-## Scoring
-
-Each worker is scored algorithmically (no LLM judge):
-
-| Component | Max | How |
-|-----------|-----|-----|
-| Originality | 20 | Git diff lines vs baseline: ≥50→20, ≥20→15, ≥10→10, ≥5→5 |
-| Correctness | 20 | KAT hash matches baseline hash |
-| Speed | 40 | `baseline_duration / worker_duration × 40` |
-| Memory | 20 | `baseline_memory / worker_memory × 20` |
-| **Total** | **100** | Sum of all components |
-
-Higher score wins. Ties are recorded but no loss assigned.
-
-## Baseline Sieve
-
-The reference implementation is a self-contained Go module (`module simplesieve`) with:
-
-- `main.go`: CLI wrapper with `-limit` and `-hash` flags; outputs KAT hash to stdout and JSON metrics to stderr
-- `internal/sieve/sieve.go`: Bit-packed segmented Sieve of Eratosthenes with wheel-210 factorization
-
-Workers edit only `internal/sieve/sieve.go`; `main.go` is a stable wrapper.
-
-## Prerequisites
-
-- Go 1.21+
-- Ollama on two hosts (`worker1:11434`, `worker2:11434`) or localhost fallback
-- A tool-capable model (e.g., `qwen2.5:0.5b`): `ollama pull qwen2.5:0.5b` on each worker host
-- `jq` and `bc` for JSON and arithmetic in CGI scripts
-
-## Running a Match
+`scout/cgi-bin/workspace/git_status.sh`:
 
 ```bash
-curl -X POST http://localhost:8080/cgi-bin/mcp/tools/call.sh \
-  -d '{"name":"arena.run_match","arguments":{}}'
+#!/bin/bash
+INPUT=$(cat)
+WORKSPACE="/home/scout/projects/sandbox/workspace"
+cd "$WORKSPACE"
+OUTPUT=$(git status --porcelain 2>&1)
+echo "{\"success\":true,\"status\":\"$(echo "$OUTPUT" | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')\"}"
 ```
 
-With custom hosts and model:
+Make it executable: `chmod +x scout/cgi-bin/workspace/git_status.sh`
+
+### 2. Write the wiki documentation
+
+`workspace/.wiki/tools/git_status.md`:
+
+```markdown
+# Tool: git.status
+
+## Description
+Show the working tree status in the workspace git repository.
+
+## Parameters
+(none)
+
+## Returns
+- `status` (string): Git status output (porcelain format)
+```
+
+### 3. Register in `workspace/.wiki/index.json`
+
+Add to the `tools` array:
+
+```json
+{
+  "name": "git.status",
+  "description": "Show working tree status",
+  "parameters": {"type": "object", "properties": {}},
+  "wiki_file": "tools/git_status.md"
+}
+```
+
+### 4. Register in `scout/cgi-bin/mcp/tools/list.sh`
+
+Add to the JSON array:
+
+```json
+{"name": "git.status", "description": "Show working tree status", "input_schema": {"type": "object", "properties": {}}}
+```
+
+### 5. Add routing in `scout/cgi-bin/mcp/tools/call.sh`
+
+Add a new case:
+
 ```bash
-curl -X POST http://localhost:8080/cgi-bin/mcp/tools/call.sh \
-  -d '{"name":"arena.run_match","arguments":{"worker1_host":"192.168.1.10:11434","worker2_host":"192.168.1.11:11434","model":"qwen2.5:7b"}}'
+"git.status")
+    exec "$WORKSPACE_DIR/git_status.sh"
+    ;;
 ```
 
-## API Endpoints
+### 6. Restart is not needed
 
-| Route | Description |
-|-------|-------------|
-| `GET /health` | Health check |
-| `GET /status` | Server status, sessions, workers |
-| `GET /events` | Server-Sent Events stream |
-| `POST /cgi-bin/<path>` | Execute CGI tool script |
+The CGI scripts are loaded on each request — just ensure `list.sh` and `call.sh` are updated.
+
+## Extending: Adding Guides
+
+Guides are reference documents the agent can fetch with `wiki.lookup`.
+
+To add a guide (e.g., a Git workflow guide):
+
+### 1. Create the Markdown file
+
+`workspace/.wiki/guides/git_workflow.md`:
+
+```markdown
+# Guide: Git Workflow
+
+## Recommended Git Workflow for Coding Tasks
+
+1. `git.status` — check current state
+2. `git.add` — stage relevant files
+3. `git.commit` — commit with descriptive message
+4. `git.log` — review history
+```
+
+### 2. Register in `workspace/.wiki/index.json`
+
+Add to the `guides` array:
+
+```json
+{"name": "git_workflow", "file": "guides/git_workflow.md"}
+```
+
+The agent discovers it via `wiki.lookup({"topic": "git_workflow"})`.
+
+## API Reference
+
+| Route | Method | Description |
+|-------|--------|-------------|
+| `GET /health` | GET | Health check |
+| `GET /status` | GET | Server status, sessions, workers |
+| `GET /events` | GET | Server-Sent Events stream |
+| `POST /cgi-bin/mcp/tools/list.sh` | POST | Get tool definitions |
+| `POST /cgi-bin/mcp/tools/call.sh` | POST | Execute a tool (`{"name":"...","arguments":{...}}`) |
+
+Tool calls to `call.sh` require a JSON body with `name` (tool name) and `arguments` (object). Sessions are managed via `scout_session` cookie.
+
+## Configuration
+
+`mcp_poc/config.yaml`:
+
+```yaml
+scout:
+  host: "localhost"
+  port: 8080
+  base_url: "http://localhost:8080/cgi-bin/mcp/tools"
+
+ollama:
+  host: "localhost"
+  port: 11434
+  model: "qwen2.5-coder:7b"
+  timeout: 300
+
+workspace:
+  path: "/home/scout/projects/sandbox/workspace"
+  wiki_path: "/home/scout/projects/sandbox/workspace/.wiki"
+
+agent:
+  max_turns: 20
+  temperature: 0.1
+```
