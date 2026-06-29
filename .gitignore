@@ -14,3 +14,7 @@ workspace/.session-log/
 
 # Pipeline working memory
 workspace/.context/
+
+# Python cache
+__pycache__/
+*.pyc
